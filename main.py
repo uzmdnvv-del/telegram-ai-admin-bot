@@ -1,10 +1,10 @@
-from __future__ import annotations
-
+import asyncio
+import json
 import os
 import sqlite3
-import threading
-import time
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -16,6 +16,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 APP_URL = os.getenv("APP_URL")
 
@@ -81,24 +82,6 @@ def get_all_users() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def get_user_count() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
-    return count
-
-
-def get_user_messages(telegram_id: int) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, user_message, ai_response, created_at FROM messages WHERE telegram_id = ? ORDER BY id DESC LIMIT 10",
-        (telegram_id,),
-    ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-
 async def send_admin_notification(user_data: dict) -> None:
     if not ADMIN_TELEGRAM_ID:
         return
@@ -118,29 +101,6 @@ async def send_admin_notification(user_data: dict) -> None:
         await app.shutdown()
     except Exception as e:
         print(f"Failed to notify admin: {e}")
-
-
-async def send_admin_summary() -> None:
-    if not ADMIN_TELEGRAM_ID:
-        return
-    users = get_all_users()
-    text = "👨‍💼 Admin panel\n\n"
-    text += f"Umumiy foydalanuvchilar: {len(users)}\n\n"
-    if users:
-        for u in users[:10]:
-            text += (
-                f"- {u['first_name'] or 'Noma’lum'} {u['last_name'] or ''} | "
-                f"@{u['username'] or 'yo‘q'} | ID: {u['telegram_id']}\n"
-            )
-    else:
-        text += "Hozircha foydalanuvchi yo‘q."
-    try:
-        app = Application.builder().token(BOT_TOKEN).build()
-        await app.initialize()
-        await app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=text)
-        await app.shutdown()
-    except Exception as e:
-        print(f"Failed to send admin summary: {e}")
 
 
 async def start_command(update: Update, context: CallbackContext) -> None:
@@ -171,6 +131,64 @@ async def start_command(update: Update, context: CallbackContext) -> None:
         "Ayniqsa, men Gemini AI yordamida javob beraman."
     )
     await update.message.reply_text(welcome)
+
+
+async def generate_ai_reply(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "Gemini API kaliti sozlanmagan. Admin .env sozlamalarini tekshirishi kerak."
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "systemInstruction": {
+            "parts": [{
+                "text": "Sen foydali va muloyim AI yordamchisan. Foydalanuvchiga u yozgan tilda javob ber; o‘zbekcha savollarga o‘zbekcha javob qaytar."
+            }]
+        },
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    def call_gemini() -> str:
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        candidates = result.get("candidates", [])
+        if not candidates:
+            raise ValueError("Gemini javob qaytarmadi.")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(
+            part["text"] for part in parts if isinstance(part.get("text"), str)
+        ).strip()
+        if not answer:
+            raise ValueError("Gemini javobi bo‘sh.")
+        return answer
+
+    try:
+        return await asyncio.to_thread(call_gemini)
+    except HTTPError as exc:
+        print(f"Gemini API HTTP xatosi: {exc.code}")
+        return "AI xizmatida vaqtinchalik xatolik yuz berdi. Birozdan keyin qayta urinib ko‘ring."
+    except (URLError, TimeoutError):
+        return "AI xizmatiga ulanib bo‘lmadi. Birozdan keyin qayta urinib ko‘ring."
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        print(f"Gemini javobini o‘qishda xatolik: {exc}")
+        return "AI javobini tayyorlashda xatolik yuz berdi."
+    except Exception as exc:
+        print(f"Kutilmagan Gemini xatosi: {exc}")
+        return "Kutilmagan xatolik yuz berdi. Keyinroq qayta urinib ko‘ring."
 
 
 async def handle_message(update: Update, context: CallbackContext) -> None:
@@ -206,9 +224,14 @@ async def admin_command(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Bu buyruq faqat admin uchun! ❌")
         return
 
-    users = get_all_users()
-    count = len(users)
-    text = f"👨‍💼 Admin panel\n\nFoydalanuvchilar soni: {count}\n\n"
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    users = conn.execute(
+        "SELECT telegram_id, username, first_name, last_name, created_at FROM users ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+
+    text = f"👨‍💼 Admin panel\n\nFoydalanuvchilar soni: {len(users)}\n\n"
     if users:
         for u in users:
             text += (
@@ -221,27 +244,40 @@ async def admin_command(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(text)
 
 
-async def generate_ai_reply(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return "Botga Gemini API kaliti ulanmagan. Iltimos .env faylga GEMINI_API_KEY qo‘shing."
-
-    # Placeholder simple AI response with no external dependency to keep the project runnable.
-    # Replace this with real Gemini API integration when ready.
-    response = (
-        f"Sizning savolingiz: {prompt}\n\n"
-        "Bu test javob. AI integratsiyasi uchun Gemini API kalitini to‘g‘ri sozlang va "
-        "generate_ai_reply() funksiyasini real API chaqiruvi bilan almashtiring."
-    )
-    return response
-
-
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN topilmadi. .env faylga BOT_TOKEN yozing.")
 
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            username TEXT,
+            user_message TEXT,
+            ai_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(telegram_id) REFERENCES users(telegram_id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
 
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
